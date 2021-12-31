@@ -22,31 +22,42 @@
  */
 package si.mazi.rescu;
 
-import oauth.signpost.OAuthConsumer;
-import oauth.signpost.exception.OAuthException;
-import oauth.signpost.http.HttpRequest;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import si.mazi.rescu.oauth.RescuOAuthRequestAdapter;
-import si.mazi.rescu.utils.HttpUtils;
-
-import javax.net.ssl.HostnameVerifier;
-import javax.net.ssl.HttpsURLConnection;
-import javax.net.ssl.SSLSocketFactory;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
 import java.net.Proxy;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URL;
 import java.net.URLConnection;
+import java.net.http.HttpClient;
+import java.net.http.HttpClient.Redirect;
+import java.net.http.HttpClient.Version;
+import java.net.http.HttpRequest.BodyPublishers;
+import java.net.http.HttpRequest.Builder;
+import java.net.http.HttpResponse;
+import java.net.http.HttpResponse.BodyHandlers;
+import java.time.Duration;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.zip.GZIPInputStream;
+
+import javax.net.ssl.HostnameVerifier;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLSocketFactory;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import oauth.signpost.OAuthConsumer;
+import oauth.signpost.exception.OAuthCommunicationException;
+import oauth.signpost.exception.OAuthExpectationFailedException;
+import oauth.signpost.exception.OAuthMessageSignerException;
 
 /**
  * Various HTTP utility methods
@@ -79,6 +90,7 @@ class HttpTemplate {
     private final SSLSocketFactory sslSocketFactory;
     private final HostnameVerifier hostnameVerifier;
     private final OAuthConsumer oAuthConsumer;
+    private final HttpClient client;
 
     HttpTemplate(int readTimeout, String proxyHost, Integer proxyPort, Proxy.Type proxyType,
                  SSLSocketFactory sslSocketFactory, HostnameVerifier hostnameVerifier, OAuthConsumer oAuthConsumer) {
@@ -92,7 +104,10 @@ class HttpTemplate {
         this.sslSocketFactory = sslSocketFactory;
         this.hostnameVerifier = hostnameVerifier;
         this.oAuthConsumer = oAuthConsumer;
-
+        this.client = HttpClient.newBuilder()
+      	      .followRedirects(Redirect.NORMAL)
+      	      .build();
+        
         defaultHttpHeaders.put("Accept-Charset", CHARSET_UTF_8);
         // defaultHttpHeaders.put("Content-Type", "application/x-www-form-urlencoded");
         defaultHttpHeaders.put("Accept", "application/json");
@@ -108,7 +123,7 @@ class HttpTemplate {
         }
     }
 
-    HttpURLConnection send(String urlString, String requestBody, Map<String, String> httpHeaders, HttpMethod method) throws IOException {
+    CompletableFuture<HttpResponse<String>> send(String urlString, String requestBody, Map<String, String> httpHeaders, HttpMethod method) throws IOException, URISyntaxException {
         if (requestBody != null && requestBody.length() > 0) {
             log.debug("Executing {} request at {}  body \n{}", method, urlString, truncate(requestBody, requestMaxLogLen));
         } else {
@@ -119,47 +134,44 @@ class HttpTemplate {
         preconditionNotNull(urlString, "urlString cannot be null");
         preconditionNotNull(httpHeaders, "httpHeaders should not be null");
 
-        int contentLength = requestBody == null ? 0 : requestBody.getBytes().length;
-        HttpURLConnection connection = configureURLConnection(method, urlString, httpHeaders, contentLength);
-
-        if (oAuthConsumer != null) {
-            HttpRequest request = new RescuOAuthRequestAdapter(connection, requestBody);
-
-            try {
-                oAuthConsumer.sign(request);
-            } catch (OAuthException e) {
-                throw new RuntimeException("OAuth error", e);
-            }
-        }
-
-        if (contentLength > 0) {
-            // Write the request body
-            OutputStream out = connection.getOutputStream();
-            out.write(requestBody.getBytes(CHARSET_UTF_8));
-            out.flush();
-        }
-        return connection;
+        java.net.http.HttpRequest request;
+        
+		Builder restRequestBuilder = java.net.http.HttpRequest.newBuilder()
+			     .uri(new URI(urlString))
+			     .timeout(Duration.ofSeconds(10));
+		
+		if(method.equals(HttpMethod.POST) || method.equals(HttpMethod.PUT)) {
+			restRequestBuilder.method(method.name(), BodyPublishers.ofString(requestBody));	
+		} else {
+			restRequestBuilder.method(method.name(), BodyPublishers.noBody());
+		}
+		
+		httpHeaders.entrySet().stream().forEach(entry -> {
+			restRequestBuilder.setHeader(entry.getKey(), entry.getValue());
+		});
+		
+		request = restRequestBuilder.build();
+		
+		if(oAuthConsumer!=null) {
+			try {
+				oAuthConsumer.sign(request);
+			} catch (OAuthMessageSignerException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			} catch (OAuthExpectationFailedException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			} catch (OAuthCommunicationException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			}
+		}
+		
+		return client.sendAsync(request, BodyHandlers.ofString());        
     }
 
-    InvocationResult receive(HttpURLConnection connection) throws IOException {
-        int httpStatus = connection.getResponseCode();
-        log.debug("Request http status = {}", httpStatus);
-        if (log.isTraceEnabled()) {
-            for (Map.Entry<String, List<String>> entry : connection.getHeaderFields().entrySet()) {
-                if (entry.getKey() != null) {
-                    log.trace("Header response property: key='{}', value='{}'", entry.getKey(), entry.getValue());
-                }
-            }
-        }
-
-        InputStream inputStream = !HttpUtils.isErrorStatusCode(httpStatus) ? connection.getInputStream() : connection.getErrorStream();
-        String responseString = readInputStreamAsEncodedString(inputStream, connection);
-        if (responseString != null && responseString.startsWith("\uFEFF")) {
-            responseString = responseString.substring(1);
-        }
-        log.debug("Http call returned {}; response body:\n{}", httpStatus, truncate(responseString, responseMaxLogLen));
-
-        return new InvocationResult(responseString, httpStatus);
+    InvocationResult receive(CompletableFuture<HttpResponse<String>> futureResponse) throws IOException, InterruptedException, ExecutionException {
+        return new InvocationResult(futureResponse.thenApply(HttpResponse::body).get(), futureResponse.thenApply(HttpResponse::statusCode).get());
     }
 
     /**

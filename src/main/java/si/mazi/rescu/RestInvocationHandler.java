@@ -21,22 +21,28 @@
  */
 package si.mazi.rescu;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
+import java.io.IOException;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Method;
+import java.net.URISyntaxException;
+import java.net.http.HttpResponse;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+
+import javax.ws.rs.Path;
+import javax.ws.rs.core.MediaType;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 import si.mazi.rescu.serialization.PlainTextResponseReader;
 import si.mazi.rescu.serialization.jackson.DefaultJacksonObjectMapperFactory;
 import si.mazi.rescu.serialization.jackson.JacksonObjectMapperFactory;
 import si.mazi.rescu.serialization.jackson.JacksonResponseReader;
-
-import javax.ws.rs.Path;
-import javax.ws.rs.core.MediaType;
-import java.io.IOException;
-import java.lang.reflect.InvocationHandler;
-import java.lang.reflect.Method;
-import java.net.HttpURLConnection;
-import java.util.HashMap;
-import java.util.Map;
 
 /**
  * @author Matija Mazi
@@ -99,7 +105,7 @@ public class RestInvocationHandler implements InvocationHandler {
 
         RestMethodMetadata methodMetadata = getMetadata(method);
 
-        HttpURLConnection connection = null;
+        CompletableFuture<HttpResponse<String>> connection = null;
         RestInvocation invocation = null;
         Object lock = getValueGenerator(args);
         if (lock == null) {
@@ -122,7 +128,7 @@ public class RestInvocationHandler implements InvocationHandler {
         }
     }
 
-    private boolean makeAware(Object result, HttpURLConnection connection, RestInvocation invocation) {
+    private boolean makeAware(Object result, CompletableFuture<HttpResponse<String>> connection, RestInvocation invocation) {
         boolean madeAware = false;
         if (result instanceof InvocationAware) {
             try {
@@ -134,7 +140,7 @@ public class RestInvocationHandler implements InvocationHandler {
         }
         if (result instanceof HttpResponseAware && connection != null) {
             try {
-                ((HttpResponseAware) result).setResponseHeaders(connection.getHeaderFields());
+                ((HttpResponseAware) result).setResponseHeaders(connection.thenApply(HttpResponse::headers).get().map());
                 madeAware = true;
             } catch (Exception ex) {
                 log.warn("Failed to set response headers on the HttpResponseAware", ex);
@@ -143,7 +149,7 @@ public class RestInvocationHandler implements InvocationHandler {
         return madeAware;
     }
 
-    protected HttpURLConnection invokeHttp(RestInvocation invocation) throws IOException {
+    protected CompletableFuture<HttpResponse<String>> invokeHttp(RestInvocation invocation) throws IOException, URISyntaxException {
         RestMethodMetadata methodMetadata = invocation.getMethodMetadata();
 
         RequestWriter requestWriter = requestWriterResolver.resolveWriter(invocation.getMethodMetadata());
@@ -152,8 +158,8 @@ public class RestInvocationHandler implements InvocationHandler {
         return httpTemplate.send(invocation.getInvocationUrl(), requestBody, invocation.getAllHttpHeaders(), methodMetadata.getHttpMethod());
     }
 
-    protected Object receiveAndMap(RestMethodMetadata methodMetadata, HttpURLConnection connection) throws IOException {
-        InvocationResult invocationResult = httpTemplate.receive(connection);
+    protected Object receiveAndMap(RestMethodMetadata methodMetadata, CompletableFuture<HttpResponse<String>> response) throws IOException, InterruptedException, ExecutionException {
+        InvocationResult invocationResult = httpTemplate.receive(response);
         return mapInvocationResult(invocationResult, methodMetadata);
     }
 
